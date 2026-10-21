@@ -1,0 +1,24 @@
+import type { CapacitorConfig } from '@capacitor/cli';
+
+const config: CapacitorConfig = {
+  appId: 'com.projectos.app',
+  appName: 'Project OS',
+  webDir: 'dist',
+  server: {
+    androidScheme: 'https',
+    cleartext: true,
+  },
+  plugins: {
+    LocalNotifications: {
+      smallIcon: 'ic_launcher_round',
+      iconColor: '#3b82f6',
+      sound: 'beep.wav',
+    },
+    StatusBar: {
+      style: 'DARK',
+      backgroundColor: '#090d16',
+    },
+  },
+};
+
+export default config;

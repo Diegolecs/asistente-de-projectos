@@ -1,0 +1,6 @@
+{
+  "name": "Project OS",
+  "description": "Sistema personal y conversacional de proyectos asistido por IA con memoria estructurada y agente especializado.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,503 @@
+/**
+ * Audio Service for Project OS
+ * Handles voice recording with MediaRecorder, transcription via Gemini,
+ * and text-to-speech playback with msedge-tts backend.
+ */
+
+// Supported MIME types for MediaRecorder across Chrome, Safari, Firefox, Edge
+function getSupportedMimeType(): string {
+  const types = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+    'audio/ogg',
+    'audio/wav',
+  ];
+
+  for (const type of types) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(type)) {
+      return type;
+    }
+  }
+
+  return ''; // fallback to browser default
+}
+
+export interface AudioPlaybackCallbacks {
+  onStart?: () => void;
+  onEnd?: () => void;
+  onError?: (err: Error) => void;
+}
+
+class AudioService {
+  private mediaRecorder: MediaRecorder | null = null;
+  private audioChunks: Blob[] = [];
+  private mediaStream: MediaStream | null = null;
+  private isCurrentlyRecording = false;
+
+  // Real-time speech recognition assist for whisper detection
+  private recognitionInstance: any = null;
+  private recognitionTranscript = '';
+
+  // Real-time Audio Analysis for reactive microphone waveform
+  private audioContext: AudioContext | null = null;
+  private analyserNode: AnalyserNode | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
+  private frequencyDataArray: Uint8Array<ArrayBuffer> | null = null;
+
+  // TTS Playback state
+  private currentAudioElement: HTMLAudioElement | null = null;
+  private currentPlayingId: string | null = null;
+  private currentBlobUrl: string | null = null;
+  private currentCallbacks: AudioPlaybackCallbacks | null = null;
+  private listeners: Set<(playingId: string | null) => void> = new Set();
+
+  /**
+   * Subscribe to global playback state changes
+   */
+  subscribePlayback(listener: (playingId: string | null) => void): () => void {
+    this.listeners.add(listener);
+    listener(this.currentPlayingId);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private notifyPlaybackChange(): void {
+    this.listeners.forEach((listener) => listener(this.currentPlayingId));
+  }
+
+  public getPlayingId(): string | null {
+    return this.currentPlayingId;
+  }
+
+  /**
+   * Check if microphone recording is supported by current browser
+   */
+  public isRecordingSupported(): boolean {
+    return typeof navigator !== 'undefined' &&
+      Boolean(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function' && typeof MediaRecorder !== 'undefined');
+  }
+
+  /**
+   * Start recording microphone audio
+   */
+  public async startRecording(): Promise<void> {
+    if (this.isCurrentlyRecording) {
+      this.cancelRecording();
+    }
+
+    if (!this.isRecordingSupported()) {
+      throw new Error('La grabación de audio no está soportada en este navegador.');
+    }
+
+    try {
+      this.audioChunks = [];
+      // Configure audio capture for high sensitivity: avoid aggressive noise cancellation
+      // that suppresses soft whispers, and enable autoGainControl to boost quiet voices
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: false, // Prevents whispers from being swallowed as noise
+          autoGainControl: true,   // Dynamically boosts soft whispers and murmurs
+        },
+      });
+
+      this.mediaStream = stream;
+
+      // Start parallel Web Speech Recognition for instant, high-precision whisper capture
+      this.recognitionTranscript = '';
+      try {
+        const SpeechClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (SpeechClass) {
+          const rec = new SpeechClass();
+          rec.continuous = true;
+          rec.interimResults = true;
+          rec.lang = 'es-419';
+          rec.onresult = (evt: any) => {
+            let fullText = '';
+            for (let i = 0; i < evt.results.length; i++) {
+              fullText += evt.results[i][0].transcript + ' ';
+            }
+            this.recognitionTranscript = fullText.trim();
+          };
+          rec.onerror = () => {};
+          rec.start();
+          this.recognitionInstance = rec;
+        }
+      } catch (speechErr) {
+        console.info('[AudioService] Native SpeechRecognition not active:', speechErr);
+      }
+
+      // Initialize real-time Web Audio API analyzer for reactive voice feedback
+      try {
+        const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioCtxClass) {
+          this.audioContext = new AudioCtxClass();
+          this.analyserNode = this.audioContext.createAnalyser();
+          this.analyserNode.fftSize = 64; // 32 frequency bins
+          this.analyserNode.smoothingTimeConstant = 0.3;
+          this.analyserNode.minDecibels = -90;
+          this.analyserNode.maxDecibels = -5;
+          this.sourceNode = this.audioContext.createMediaStreamSource(stream);
+          this.sourceNode.connect(this.analyserNode);
+          this.frequencyDataArray = new Uint8Array(this.analyserNode.frequencyBinCount);
+        }
+      } catch (audioCtxErr) {
+        console.warn('[AudioService] AudioContext Analyser initialization notice:', audioCtxErr);
+      }
+
+      const mimeType = getSupportedMimeType();
+      const options = mimeType ? { mimeType } : undefined;
+
+      this.mediaRecorder = new MediaRecorder(stream, options);
+
+      this.mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          this.audioChunks.push(event.data);
+        }
+      };
+
+      this.mediaRecorder.start(250); // Slice every 250ms for reliable chunks
+      this.isCurrentlyRecording = true;
+    } catch (err: any) {
+      this.cleanupStream();
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        throw new Error('Permiso de micrófono denegado. Permite el acceso al micrófono en los ajustes de tu navegador.');
+      }
+      throw new Error(`Error al iniciar la grabación de audio: ${err.message || err}`);
+    }
+  }
+
+  /**
+   * Returns real-time reactive volume/frequency levels for a given number of waveform bars.
+   * Normalized between 0.0 (silence) and 1.0 (loud speech).
+   * Highly sensitive to whispers and murmurs.
+   */
+  public getReactiveAudioLevels(barsCount = 16): number[] {
+    if (!this.analyserNode || !this.frequencyDataArray || !this.isCurrentlyRecording) {
+      return new Array(barsCount).fill(0.04);
+    }
+
+    try {
+      this.analyserNode.getByteFrequencyData(this.frequencyDataArray);
+
+      const binCount = this.analyserNode.frequencyBinCount;
+      const step = Math.max(1, Math.floor(binCount / barsCount));
+      const levels: number[] = [];
+
+      for (let i = 0; i < barsCount; i++) {
+        const binIdx = Math.min(i * step, binCount - 1);
+        const rawVal = this.frequencyDataArray[binIdx] || 0;
+
+        // Lower threshold to 4 so whispers visibly animate the waveform
+        if (rawVal < 4) {
+          levels.push(0.03); // Quiet / silence
+        } else {
+          // Normalize active human voice amplitude smoothly
+          const normalized = Math.min(1.0, Math.max(0.08, (rawVal - 4) / 160));
+          levels.push(normalized);
+        }
+      }
+
+      return levels;
+    } catch {
+      return new Array(barsCount).fill(0.04);
+    }
+  }
+
+  /**
+   * Stop recording and return the recorded audio Blob
+   */
+  public stopRecording(): Promise<Blob> {
+    return new Promise((resolve, reject) => {
+      if (!this.mediaRecorder || !this.isCurrentlyRecording) {
+        this.cleanupStream();
+        return reject(new Error('No hay una grabación de audio activa.'));
+      }
+
+      this.mediaRecorder.onstop = () => {
+        try {
+          const mimeType = this.mediaRecorder?.mimeType || 'audio/webm';
+          const audioBlob = new Blob(this.audioChunks, { type: mimeType });
+          this.cleanupStream();
+          this.isCurrentlyRecording = false;
+          resolve(audioBlob);
+        } catch (err) {
+          this.cleanupStream();
+          this.isCurrentlyRecording = false;
+          reject(err);
+        }
+      };
+
+      this.mediaRecorder.onerror = (e: any) => {
+        this.cleanupStream();
+        this.isCurrentlyRecording = false;
+        reject(e.error || new Error('Error durante la grabación de audio.'));
+      };
+
+      try {
+        this.mediaRecorder.stop();
+      } catch (err) {
+        this.cleanupStream();
+        this.isCurrentlyRecording = false;
+        reject(err);
+      }
+    });
+  }
+
+  /**
+   * Cancel and discard current recording
+   */
+  public cancelRecording(): void {
+    if (this.mediaRecorder && this.isCurrentlyRecording) {
+      try {
+        this.mediaRecorder.stop();
+      } catch (_) {
+        // ignore
+      }
+    }
+    this.cleanupStream();
+    this.audioChunks = [];
+    this.isCurrentlyRecording = false;
+  }
+
+  public isRecording(): boolean {
+    return this.isCurrentlyRecording;
+  }
+
+  private cleanupStream(): void {
+    if (this.recognitionInstance) {
+      try {
+        this.recognitionInstance.stop();
+      } catch (_) {}
+      this.recognitionInstance = null;
+    }
+
+    if (this.sourceNode) {
+      try {
+        this.sourceNode.disconnect();
+      } catch (_) {}
+      this.sourceNode = null;
+    }
+    if (this.analyserNode) {
+      try {
+        this.analyserNode.disconnect();
+      } catch (_) {}
+      this.analyserNode = null;
+    }
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      try {
+        this.audioContext.close();
+      } catch (_) {}
+      this.audioContext = null;
+    }
+    this.frequencyDataArray = null;
+
+    if (this.mediaStream) {
+      this.mediaStream.getTracks().forEach((track) => track.stop());
+      this.mediaStream = null;
+    }
+    this.mediaRecorder = null;
+  }
+
+  /**
+   * Convert Blob to Base64 string
+   */
+  public async blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const result = reader.result as string;
+        // strip data URL prefix (e.g. "data:audio/webm;base64,")
+        const base64 = result.includes(',') ? result.split(',')[1] : result;
+        resolve(base64);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  /**
+   * Send audio Blob to backend for transcription
+   */
+  public async transcribeAudio(blob: Blob): Promise<{ text: string }> {
+    const audioBase64 = await this.blobToBase64(blob);
+    const mimeType = blob.type || 'audio/webm';
+    const localHint = this.recognitionTranscript.trim();
+
+    try {
+      const response = await fetch('/api/transcribe-audio', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          audioBase64,
+          mimeType,
+          clientHint: localHint,
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        let text = typeof data.text === 'string' ? data.text.trim() : '';
+        if (!text && localHint) {
+          text = localHint;
+        }
+        return { text };
+      }
+    } catch (fetchErr) {
+      console.warn('[AudioService] Server transcribe error, using local hint if available:', fetchErr);
+    }
+
+    // Fallback: If network failed or server returned empty, but local whisper recognition captured speech:
+    if (localHint) {
+      return { text: localHint };
+    }
+
+    return { text: '' };
+  }
+
+  /**
+   * Stop current voice synthesis playback
+   */
+  public stopPlayback(): void {
+    if (this.currentAudioElement) {
+      this.currentAudioElement.pause();
+      this.currentAudioElement.currentTime = 0;
+      this.currentAudioElement = null;
+    }
+
+    if (this.currentBlobUrl) {
+      URL.revokeObjectURL(this.currentBlobUrl);
+      this.currentBlobUrl = null;
+    }
+
+    // Cancel browser speech synthesis if active
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+
+    if (this.currentCallbacks?.onEnd) {
+      this.currentCallbacks.onEnd();
+    }
+
+    this.currentPlayingId = null;
+    this.currentCallbacks = null;
+    this.notifyPlaybackChange();
+  }
+
+  /**
+   * Play Text-To-Speech for a message using msedge-tts backend (with browser speech fallback)
+   */
+  public async playTts(
+    id: string,
+    text: string,
+    callbacks?: AudioPlaybackCallbacks
+  ): Promise<void> {
+    // If currently playing this specific message, toggle stop
+    if (this.currentPlayingId === id) {
+      this.stopPlayback();
+      return;
+    }
+
+    // Stop previous audio playback first
+    this.stopPlayback();
+
+    this.currentPlayingId = id;
+    this.currentCallbacks = callbacks || null;
+    this.notifyPlaybackChange();
+
+    try {
+      // 1. Attempt server msedge-tts endpoint
+      const response = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          voice: 'es-MX-JorgeNeural',
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`TTS server respondió con código ${response.status}`);
+      }
+
+      const audioBlob = await response.blob();
+      const blobUrl = URL.createObjectURL(audioBlob);
+      this.currentBlobUrl = blobUrl;
+
+      const audio = new Audio(blobUrl);
+      this.currentAudioElement = audio;
+
+      audio.onplay = () => {
+        callbacks?.onStart?.();
+      };
+
+      audio.onended = () => {
+        this.stopPlayback();
+      };
+
+      audio.onerror = (e) => {
+        console.warn('[AudioService] Error reproduciendo audio buffer, activando fallback local:', e);
+        this.fallbackSpeechSynthesis(text, callbacks);
+      };
+
+      await audio.play();
+    } catch (err: any) {
+      console.warn('[AudioService] Server TTS falló, recurriendo a Web Speech API:', err?.message);
+      this.fallbackSpeechSynthesis(text, callbacks);
+    }
+  }
+
+  /**
+   * Client-side fallback using window.speechSynthesis
+   */
+  private fallbackSpeechSynthesis(text: string, callbacks?: AudioPlaybackCallbacks): void {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      const err = new Error('Síntesis de voz no disponible.');
+      callbacks?.onError?.(err);
+      this.stopPlayback();
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+
+    // Clean markdown before speaking
+    const clean = text
+      .replace(/[*_#`[\]()]/g, '')
+      .replace(/•|-/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const utterance = new SpeechSynthesisUtterance(clean);
+    utterance.lang = 'es-MX';
+    utterance.rate = 1.05;
+
+    // Pick best Spanish voice if available
+    const voices = window.speechSynthesis.getVoices();
+    const esVoice = voices.find((v) => v.lang.startsWith('es-MX') || v.lang.startsWith('es-ES') || v.lang.startsWith('es'));
+    if (esVoice) {
+      utterance.voice = esVoice;
+    }
+
+    utterance.onstart = () => {
+      callbacks?.onStart?.();
+    };
+
+    utterance.onend = () => {
+      this.stopPlayback();
+    };
+
+    utterance.onerror = (e) => {
+      callbacks?.onError?.(new Error(e.error || 'Error en síntesis'));
+      this.stopPlayback();
+    };
+
+    window.speechSynthesis.speak(utterance);
+  }
+}
+
+export const audioService = new AudioService();

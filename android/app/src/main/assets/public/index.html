@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="es" class="h-full">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      // Gracefully ignore Vite WebSocket connection logs in preview iframe per environment constraints
+      (function() {
+        const origError = console.error;
+        const origWarn = console.warn;
+        function isVite(arg) {
+          if (!arg) return false;
+          if (arg === '[vite]') return true;
+          try {
+            const s = typeof arg === 'string' ? arg : (arg.message || String(arg));
+            return s.includes('[vite]');
+          } catch {
+            return false;
+          }
+        }
+        console.error = function(...args) {
+          if (args.some(isVite)) return;
+          origError.apply(console, args);
+        };
+        console.warn = function(...args) {
+          if (args.some(isVite)) return;
+          origWarn.apply(console, args);
+        };
+        window.addEventListener('unhandledrejection', function(e) {
+          if (isVite(e.reason)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          }
+        });
+        window.addEventListener('error', function(e) {
+          if (isVite(e.message) || isVite(e.error)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          }
+        });
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content" />
+    <title>Project OS</title>
+    <meta name="description" content="Sistema personal y conversacional de proyectos asistido por IA con memoria estructurada y agente especializado." />
+    <meta property="og:title" content="Project OS" />
+    <meta property="og:description" content="Sistema personal y conversacional de proyectos asistido por IA con memoria estructurada y agente especializado." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#090d16" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Project OS" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <script type="module" crossorigin src="/assets/index-CZnj8d2K.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DfkWmr5M.css">
+  <link rel="manifest" href="/manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script></head>
+  <body class="h-full bg-zinc-50 text-zinc-900 antialiased selection:bg-blue-600 selection:text-white">
+    <div id="root" class="h-full flex flex-col"></div>
+  </body>
+</html>
+
