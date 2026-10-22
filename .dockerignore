@@ -1,0 +1,17 @@
+node_modules
+dist
+build
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+android
+android/
+scripts
+dev-dist
+*.log
+npm-debug.log*
+.idea
+.vscode
+coverage
