@@ -17,6 +17,10 @@ RUN npm install --legacy-peer-deps --include=dev
 # Copy application source code and configuration files
 COPY tsconfig.json vite.config.ts fix-dirname.js server.ts ./
 COPY index.html ./
+
+# Copy Firebase applet configuration (required by googleCalendarService.ts)
+COPY firebase-applet-config.json ./
+
 COPY public ./public
 COPY src ./src
 
