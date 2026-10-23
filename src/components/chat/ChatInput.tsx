@@ -141,12 +141,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         const transcribedText = result.text.trim();
         // Send directly to the conversation agent
         onSendMessage(transcribedText);
+      } else if (result.error) {
+        setAudioError(result.error);
       } else {
         setAudioError('No se reconoció voz clara en el audio grabado.');
       }
     } catch (err: any) {
       console.warn('[Transcription Notice]:', err?.message);
-      setAudioError(err.message || 'No se reconoció voz clara en el audio.');
+      setAudioError(err.message || 'Error al procesar la grabación de voz.');
     } finally {
       setIsTranscribing(false);
       setRecordDuration(0);

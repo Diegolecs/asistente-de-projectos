@@ -56,13 +56,13 @@ function getGeminiClient(): GoogleGenAI | null {
   return new GoogleGenAI({ apiKey });
 }
 
-// Candidate models in order of priority (flagship fast reasoning models first, with quota-resilient cascade)
+// Candidate models in order of priority (official stable Gemini models with quota-resilient cascade)
 const CANDIDATE_MODELS = [
   'gemini-3.8-flash',
-  'gemini-flash-latest',
-  'gemini-3.1-flash-lite',
-  'gemini-3.5-flash',
+  'gemini-3.6-flash',
   'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-flash-latest',
   'gemini-flash-lite-latest',
 ];
 
@@ -1575,6 +1575,20 @@ async function runGeminiConversationWithTools(
           });
         }
 
+        // Check if we can fast-track response on iteration 1 for deterministic successful tool executions
+        const hasQueryTools = currentCalls.some((c: any) => c.name === 'check_calendar_availability');
+        const isSingleTurnSufficient =
+          iterations === 1 &&
+          lastToolMessages.length > 0 &&
+          !hasQueryTools &&
+          accumulatedActions.length > 0;
+
+        if (isSingleTurnSufficient) {
+          const actionSummaries = lastToolMessages.join('\n\n');
+          console.log(`[Gemini Function Calling] Fast-tracking single-turn response for model (${model})`);
+          return { reply: actionSummaries, modelUsed: model };
+        }
+
         // Push tool responses turn
         conversationContents.push({
           role: 'tool',
@@ -1635,9 +1649,6 @@ async function runGeminiConversationWithTools(
 const TRANSCRIBE_MODELS = [
   'gemini-3.5-transcribe',
   'gemini-3.8-flash',
-  'gemini-flash-latest',
-  'gemini-3.1-flash-lite',
-  'gemini-3.5-flash',
 ];
 
 // Helper to clean markdown text for natural speech synthesis
@@ -1671,6 +1682,7 @@ function cleanTextForSpeech(text: string): string {
 // Multimodal voice-to-text with Gemini cascade
 // ==========================================
 const handleTranscription = async (req: express.Request, res: express.Response) => {
+  const serverStart = Date.now();
   try {
     const { audioBase64, mimeType = 'audio/mp3', clientHint = '' } = req.body;
 
@@ -1694,9 +1706,13 @@ const handleTranscription = async (req: express.Request, res: express.Response) 
     const normalizedMime = (mimeType || 'audio/webm').trim();
 
     let transcribedText = '';
+    let successfulModel = '';
     let lastError: any = null;
+    let attemptsCount = 0;
 
     for (const model of TRANSCRIBE_MODELS) {
+      attemptsCount++;
+      const attemptStart = Date.now();
       try {
         const contents: any[] = [
           {
@@ -1715,13 +1731,14 @@ const handleTranscription = async (req: express.Request, res: express.Response) 
           },
         ];
 
+        // Optimized 5-second max timeout per model attempt to eliminate long latency cascades
         const response = await Promise.race([
           ai.models.generateContent({
             model,
             contents,
           }),
           new Promise<any>((_, reject) =>
-            setTimeout(() => reject(new Error(`Timeout transcribe on ${model}`)), 15000)
+            setTimeout(() => reject(new Error(`Timeout (${model}) after 5000ms`)), 5000)
           ),
         ]);
 
@@ -1749,24 +1766,28 @@ const handleTranscription = async (req: express.Request, res: express.Response) 
           !extracted.toLowerCase().includes('no se detecta')
         ) {
           transcribedText = extracted;
-          console.log(`[Audio Transcribe] Exitosamente transcrito con modelo ${model}: "${transcribedText.slice(0, 60)}..."`);
+          successfulModel = model;
+          const attemptMs = Date.now() - attemptStart;
+          console.log(`[Audio Transcribe] Modelo ${model} completó transcripción exitosa en ${attemptMs}ms`);
           break;
         }
       } catch (err: any) {
         lastError = err;
-        const msg = err?.message || '';
-        if (msg.includes('503') || msg.includes('high demand') || msg.includes('UNAVAILABLE')) {
-          console.info(`[Audio Transcribe] Modelo ${model} no disponible temporalmente (503), pasando al siguiente candidato.`);
-        } else {
-          console.info(`[Audio Transcribe] Modelo ${model} no completó transcripción, pasando al siguiente candidato.`);
-        }
+        const attemptMs = Date.now() - attemptStart;
+        console.info(`[Audio Transcribe] Modelo ${model} falló en ${attemptMs}ms. Motivo: ${err?.message || 'Error desconocido'}`);
       }
     }
 
+    const totalServerMs = Date.now() - serverStart;
+
     // If server models couldn't extract or detected silence, check if local whisper recognition captured it
     if (!transcribedText && clientHint && clientHint.trim()) {
-      console.log(`[Audio Transcribe] Usando clientHint de alta sensibilidad: "${clientHint}"`);
-      return res.json({ success: true, text: clientHint.trim() });
+      console.log(`[Audio Transcribe] Usando clientHint de recuperación (${totalServerMs}ms server time)`);
+      return res.json({
+        success: true,
+        text: clientHint.trim(),
+        metrics: { totalServerMs, modelUsed: 'clientHint-fallback', attemptsCount },
+      });
     }
 
     if (!transcribedText && !lastError) {
@@ -1775,22 +1796,32 @@ const handleTranscription = async (req: express.Request, res: express.Response) 
         text: '',
         isSilence: true,
         message: 'No se detectó voz clara en el audio grabado',
+        metrics: { totalServerMs, modelUsed: 'none', attemptsCount },
       });
     }
 
     if (!transcribedText) {
       if (clientHint) {
-        return res.json({ success: true, text: clientHint.trim() });
+        return res.json({
+          success: true,
+          text: clientHint.trim(),
+          metrics: { totalServerMs, modelUsed: 'clientHint-fallback', attemptsCount },
+        });
       }
       return res.status(200).json({
         success: false,
         text: '',
         error: 'No se pudo transcribir el audio.',
         details: lastError?.message || 'Sin respuesta del modelo',
+        metrics: { totalServerMs, modelUsed: 'none', attemptsCount },
       });
     }
 
-    return res.json({ success: true, text: transcribedText });
+    return res.json({
+      success: true,
+      text: transcribedText,
+      metrics: { totalServerMs, modelUsed: successfulModel, attemptsCount },
+    });
   } catch (err: any) {
     console.error('[Audio Transcribe Error]:', err);
     return res.status(500).json({ error: 'Error procesando el audio', details: err?.message });
@@ -2225,10 +2256,14 @@ CAPACIDAD MULTITAREA Y LENGUAJE NATURAL FLUIDO:
         });
       }
 
-      console.warn('[Gemini Provider] External models temporarily unavailable, serving seamlessly with local intelligence engine.');
+      console.warn('[Gemini Provider] External models temporarily unavailable, serving with local intelligence engine fallback.');
     }
 
     // Local fallback with simulated tool executions if Gemini is unavailable or key not configured
+    const fallbackWarning = !ai
+      ? 'GEMINI_API_KEY no está configurada o es vacía en el servidor. Se está utilizando el motor local de contingencia.'
+      : 'Todos los candidatos del modelo Gemini fallaron o la API key no es válida. Se está utilizando el motor local de contingencia.';
+
     const projectNames = liveProjects.map((p) => p.name).filter(Boolean);
     const isProjectRelated = isProjectOSIntent(userText, projectNames);
 
@@ -2267,6 +2302,7 @@ CAPACIDAD MULTITAREA Y LENGUAJE NATURAL FLUIDO:
       updatedProject: updatedProject || undefined,
       updatedEvents: liveEvents,
       provider: 'local-intelligence',
+      warning: fallbackWarning,
     });
   } catch (error: any) {
     console.warn('[API /api/chat] Error handled gracefully with fallback:', error?.message || error);
@@ -2275,7 +2311,7 @@ CAPACIDAD MULTITAREA Y LENGUAJE NATURAL FLUIDO:
       actionsExecuted: [],
       memoryUpdates: [],
       provider: 'fallback',
-      warning: error?.message,
+      warning: error?.message || 'Error en servidor',
     });
   }
 });

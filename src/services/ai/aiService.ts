@@ -21,14 +21,25 @@ class AIService {
     if (this.isCheckingHealth) return this.status;
     this.isCheckingHealth = true;
     try {
-      const res = await fetch('/api/health');
+      const baseUrl = (import.meta.env?.VITE_API_BASE_URL as string || '').replace(/\/$/, '');
+      const healthUrl = baseUrl ? `${baseUrl}/api/health` : '/api/health';
+      const res = await fetch(healthUrl);
       if (res.ok) {
         const data = await res.json();
+        const hasKey = Boolean(data.hasGeminiKey);
         this.status = {
-          hasGeminiKey: Boolean(data.hasGeminiKey),
-          activeProvider: data.hasGeminiKey ? 'gemini' : 'local',
-          model: data.model || 'gemini-flash-lite-latest',
+          hasGeminiKey: hasKey,
+          activeProvider: hasKey ? 'gemini' : 'local',
+          model: data.model || 'gemini-3.8-flash',
         };
+        this.setProvider(hasKey ? 'gemini' : 'local');
+      } else {
+        this.status = {
+          hasGeminiKey: false,
+          activeProvider: 'local',
+          model: 'local-intelligence',
+        };
+        this.setProvider('local');
       }
     } catch {
       // In standalone client or offline mode
@@ -37,6 +48,7 @@ class AIService {
         activeProvider: 'local',
         model: 'local-intelligence',
       };
+      this.setProvider('local');
     } finally {
       this.isCheckingHealth = false;
     }

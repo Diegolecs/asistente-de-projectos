@@ -13,8 +13,10 @@ export class GeminiProvider implements AIProvider {
   ): Promise<AIChatResponse> {
     try {
       const timeContext = options.timeContext || getDeviceFullContext();
+      const baseUrl = (import.meta.env?.VITE_API_BASE_URL as string || '').replace(/\/$/, '');
+      const chatUrl = baseUrl ? `${baseUrl}/api/chat` : '/api/chat';
 
-      const response = await fetch('/api/chat', {
+      const response = await fetch(chatUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -30,8 +32,12 @@ export class GeminiProvider implements AIProvider {
       });
 
       if (!response.ok) {
-        console.warn('API /api/chat returned status:', response.status);
-        return this.fallbackProvider.sendMessage(messages, options);
+        console.warn('API /api/chat returned error status:', response.status);
+        const fallbackRes = await this.fallbackProvider.sendMessage(messages, options);
+        return {
+          ...fallbackRes,
+          warning: `Atención: El servidor respondió con un código de error (${response.status}). Se utilizó el motor local de contingencia.`,
+        };
       }
 
       const data = await response.json();
@@ -78,9 +84,13 @@ export class GeminiProvider implements AIProvider {
         provider: data.provider || 'gemini',
         warning: data.warning,
       };
-    } catch (err) {
+    } catch (err: any) {
       console.warn('Network error calling /api/chat, falling back to local intelligence:', err);
-      return this.fallbackProvider.sendMessage(messages, options);
+      const fallbackRes = await this.fallbackProvider.sendMessage(messages, options);
+      return {
+        ...fallbackRes,
+        warning: `Atención: No se pudo conectar con el servidor de la nube (${err?.message || 'Error de red'}). Se utilizó el motor local de contingencia.`,
+      };
     }
   }
 }

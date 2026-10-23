@@ -39,6 +39,7 @@ class AudioService {
   // Real-time speech recognition assist for whisper detection
   private recognitionInstance: any = null;
   private recognitionTranscript = '';
+  private recognitionError: string | null = null;
 
   // Real-time Audio Analysis for reactive microphone waveform
   private audioContext: AudioContext | null = null;
@@ -108,26 +109,35 @@ class AudioService {
 
       // Start parallel Web Speech Recognition for instant, high-precision whisper capture
       this.recognitionTranscript = '';
+      this.recognitionError = null;
       try {
         const SpeechClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
         if (SpeechClass) {
           const rec = new SpeechClass();
           rec.continuous = true;
           rec.interimResults = true;
-          rec.lang = 'es-419';
+          rec.lang = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'es-419';
           rec.onresult = (evt: any) => {
             let fullText = '';
             for (let i = 0; i < evt.results.length; i++) {
-              fullText += evt.results[i][0].transcript + ' ';
+              if (evt.results[i][0]?.transcript) {
+                fullText += evt.results[i][0].transcript + ' ';
+              }
             }
-            this.recognitionTranscript = fullText.trim();
+            if (fullText.trim()) {
+              this.recognitionTranscript = fullText.trim();
+            }
           };
-          rec.onerror = () => {};
+          rec.onerror = (evt: any) => {
+            console.warn('[AudioService] SpeechRecognition error notice:', evt?.error || evt);
+            this.recognitionError = String(evt?.error || 'speech_recognition_error');
+          };
           rec.start();
           this.recognitionInstance = rec;
         }
-      } catch (speechErr) {
+      } catch (speechErr: any) {
         console.info('[AudioService] Native SpeechRecognition not active:', speechErr);
+        this.recognitionError = speechErr?.message || 'not_supported';
       }
 
       // Initialize real-time Web Audio API analyzer for reactive voice feedback
@@ -320,15 +330,27 @@ class AudioService {
   }
 
   /**
-   * Send audio Blob to backend for transcription
+   * Send audio Blob to backend or client provider for transcription
    */
-  public async transcribeAudio(blob: Blob): Promise<{ text: string }> {
+  public async transcribeAudio(blob: Blob): Promise<{ text: string; error?: string; isSilence?: boolean }> {
+    const tStart = performance.now();
     const audioBase64 = await this.blobToBase64(blob);
+    const tPrep = performance.now();
+    const prepMs = Math.round(tPrep - tStart);
+
     const mimeType = blob.type || 'audio/webm';
     const localHint = this.recognitionTranscript.trim();
 
+    // Fast-path: Check if local SpeechRecognition captured a complete, usable phrase (>= 3 words)
+    const isUsableClientHint = Boolean(localHint && localHint.split(/\s+/).length >= 3);
+
+    // Single primary server endpoint (/api/transcribe-audio or VITE_API_BASE_URL)
+    const baseUrl = (import.meta.env?.VITE_API_BASE_URL as string) || '';
+    const endpoint = baseUrl ? `${baseUrl.replace(/\/$/, '')}/api/transcribe-audio` : '/api/transcribe-audio';
+
+    const tNetworkStart = performance.now();
     try {
-      const response = await fetch('/api/transcribe-audio', {
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -340,24 +362,75 @@ class AudioService {
         }),
       });
 
+      const tNetworkEnd = performance.now();
+      const networkMs = Math.round(tNetworkEnd - tNetworkStart);
+      const totalMs = Math.round(tNetworkEnd - tStart);
+
       if (response.ok) {
         const data = await response.json().catch(() => ({}));
+        const serverMs = data.metrics?.totalServerMs || 'N/A';
+        const modelUsed = data.metrics?.modelUsed || 'unknown';
+
+        // Safe diagnostic latency metrics logging (NO private text or audio logged)
+        console.log(`[Audio Timings] Prep: ${prepMs}ms | Network+Server: ${networkMs}ms (Server Transcribe: ${serverMs}ms, Model: ${modelUsed}) | Overall Total: ${totalMs}ms`);
+
         let text = typeof data.text === 'string' ? data.text.trim() : '';
         if (!text && localHint) {
           text = localHint;
         }
+        if (data.isSilence || (!text && data.message)) {
+          return { text: '', isSilence: true, error: data.message || 'No se detectó voz clara en el audio.' };
+        }
         return { text };
+      } else {
+        console.warn(`[AudioService] Server transcribe error status: ${response.status} (${networkMs}ms)`);
       }
     } catch (fetchErr) {
-      console.warn('[AudioService] Server transcribe error, using local hint if available:', fetchErr);
+      console.warn('[AudioService] Server transcribe endpoint unreachable or network error:', fetchErr);
     }
 
-    // Fallback: If network failed or server returned empty, but local whisper recognition captured speech:
-    if (localHint) {
+    // Controlled Recovery Flow: Use local SpeechRecognition if server was unreachable or failed
+    if (isUsableClientHint || localHint) {
+      console.log('[AudioService] Recovered using local SpeechRecognition hint.');
       return { text: localHint };
     }
 
-    return { text: '' };
+    // Contextual diagnostic errors when recovery fails
+    if (this.recognitionError) {
+      if (this.recognitionError === 'not-allowed' || this.recognitionError === 'service-not-allowed') {
+        return {
+          text: '',
+          error: 'Servicio de voz no disponible en este navegador. Configura VITE_API_BASE_URL o habilita los permisos de micrófono.'
+        };
+      }
+      if (this.recognitionError === 'network') {
+        return {
+          text: '',
+          error: 'Error de red al procesar el reconocimiento de voz. Comprueba tu conexión a internet.'
+        };
+      }
+      if (this.recognitionError === 'no-speech') {
+        return {
+          text: '',
+          isSilence: true,
+          error: 'No se detectó habla en el audio grabado. Por favor, habla de nuevo.'
+        };
+      }
+    }
+
+    const isNative = typeof window !== 'undefined' && Boolean((window as any).Capacitor?.isNativePlatform?.());
+    if (isNative) {
+      return {
+        text: '',
+        error: 'No se pudo conectar al servidor de transcripción en Android. Configura VITE_API_BASE_URL en la aplicación.'
+      };
+    }
+
+    return {
+      text: '',
+      isSilence: true,
+      error: 'No se reconoció voz clara en el audio grabado.'
+    };
   }
 
   /**
@@ -412,7 +485,10 @@ class AudioService {
 
     try {
       // 1. Attempt server msedge-tts endpoint
-      const response = await fetch('/api/tts', {
+      const baseUrl = (import.meta.env?.VITE_API_BASE_URL as string || '').replace(/\/$/, '');
+      const ttsUrl = baseUrl ? `${baseUrl}/api/tts` : '/api/tts';
+
+      const response = await fetch(ttsUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
