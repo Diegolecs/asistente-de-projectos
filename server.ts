@@ -1701,9 +1701,9 @@ const handleTranscription = async (req: express.Request, res: express.Response) 
       return res.status(500).json({ error: 'GEMINI_API_KEY no configurada en el servidor' });
     }
 
-    // Clean data URL prefix if present
+    // Clean data URL prefix if present and strip MIME parameters (e.g. "audio/webm;codecs=opus" -> "audio/webm")
     const cleanBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '');
-    const normalizedMime = (mimeType || 'audio/webm').trim();
+    const normalizedMime = (mimeType || 'audio/webm').split(';')[0].trim();
 
     let transcribedText = '';
     let successfulModel = '';
