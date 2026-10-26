@@ -7,7 +7,7 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, Type, type FunctionDeclaration } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
-import { isProjectOSIntent } from './src/utils/intentDetection';
+import { isProjectOSIntent, detectContextLevel } from './src/utils/intentDetection';
 
 dotenv.config();
 
@@ -1471,7 +1471,7 @@ function executeTool(
 }
 
 // ==========================================
-// GEMINI MULTI-TURN FUNCTION CALLING LOOP
+// GEMINI MULTI-TURN FUNCTION CALLING & STREAMING ENGINE
 // ==========================================
 async function runGeminiConversationWithTools(
   ai: GoogleGenAI,
@@ -1482,7 +1482,8 @@ async function runGeminiConversationWithTools(
   activeProjectId: string | undefined,
   timeContext: DeviceTimeContext,
   accumulatedActions: ActionExecuted[],
-  enableTools: boolean = true
+  enableTools: boolean = true,
+  onChunk?: (text: string) => void
 ): Promise<{ reply: string; modelUsed: string } | null> {
   for (const model of CANDIDATE_MODELS) {
     try {
@@ -1515,6 +1516,31 @@ async function runGeminiConversationWithTools(
         generateConfig.tools = [{ functionDeclarations: toolDeclarations }];
       }
 
+      // If streaming requested and no tools needed (or conversation turn), stream directly
+      if (!enableTools && onChunk) {
+        const responseStream = await ai.models.generateContentStream({
+          model,
+          contents: conversationContents,
+          config: generateConfig,
+        });
+
+        let accumulatedStreamedText = '';
+        for await (const chunk of responseStream) {
+          const chunkText = chunk.text || '';
+          if (chunkText) {
+            accumulatedStreamedText += chunkText;
+            onChunk(chunkText);
+          }
+        }
+
+        if (accumulatedStreamedText.trim()) {
+          return {
+            reply: accumulatedStreamedText.trim(),
+            modelUsed: model,
+          };
+        }
+      }
+
       let response = await Promise.race([
         ai.models.generateContent({
           model,
@@ -1526,10 +1552,11 @@ async function runGeminiConversationWithTools(
         ),
       ]);
 
-      // If casual conversation without tools, return immediate response
+      // If casual conversation without tools, stream or return immediate response
       if (!enableTools) {
         const replyText = response.text || '';
         if (replyText.trim()) {
+          if (onChunk) onChunk(replyText.trim());
           return {
             reply: replyText.trim(),
             modelUsed: model,
@@ -2088,33 +2115,66 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
-    // Construct comprehensive system instruction with temporal context and tool instructions
+    // Construct 3-tier Context Architecture (Level 1: General/Casual, Level 2: Targeted Project, Level 3: Portfolio)
+    const projectNames = liveProjects.map((p) => p.name).filter(Boolean);
+    const contextLevel = isGeneral ? detectContextLevel(userText, projectNames) : 'project';
+
     let systemInstruction = '';
-    if (isGeneral) {
+    let enableTools = true;
+
+    if (contextLevel === 'general') {
+      // Level 1: Fast general chat / casual / generic Q&A (~1.5s latency)
+      enableTools = isProjectOSIntent(userText, projectNames);
+      systemInstruction = `Eres el Asistente Inteligente y Director de Estrategia de "Project OS".
+Responde con calidez, empatía y fluidez en español.
+
+CONTEXTO TEMPORAL DEL USUARIO:
+- Fecha actual: ${timeContext.formattedDate} (${timeContext.currentDate})
+- Hora actual: ${timeContext.currentTime}
+- Mañana será: ${timeContext.tomorrowDate}
+
+PROYECTOS REGISTRADOS:
+${liveProjects.map((p) => `• ${p.name} [${p.status}]`).join('\n') || 'Ninguno'}
+
+DIRECTIVAS:
+- Si el usuario te hace preguntas generales, saludos o charlas cotidianas, responde con naturalidad en 1 o 2 párrafos concisos.
+- Si el usuario menciona tareas, eventos o proyectos, utiliza las herramientas correspondientes.`;
+    } else if (contextLevel === 'project') {
+      // Level 2: Target project or directed action (~3s latency)
+      const targetProj = findTargetProject(liveProjects, undefined, activeProjectId, userText);
+      const activeProj = targetProj || liveProjects.find((p) => p.id === activeProjectId) || liveProjects[0];
+
+      systemInstruction = `Eres el Agente Especializado y Copiloto de "Project OS".
+
+CONTEXTO TEMPORAL DEL USUARIO:
+- Fecha actual: ${timeContext.formattedDate} (${timeContext.currentDate})
+- Hora actual: ${timeContext.currentTime}
+
+PROYECTO OBJETIVO ("${activeProj?.name || 'General'}"):
+- Nombre: ${activeProj?.name}
+- Estado: ${activeProj?.status}
+- Objetivo Principal: ${activeProj?.mainGoal || 'En desarrollo'}
+- Próximo Paso: ${activeProj?.nextStep || 'Por definir'}
+- Tareas Pendientes: ${JSON.stringify(activeProj?.tasks?.filter((t: any) => t.status === 'pendiente').map((t: any) => ({ title: t.title, dueDate: t.dueDate })) || [])}
+
+EVENTOS PRÓXIMOS:
+${JSON.stringify(liveEvents.slice(0, 5).map((e: any) => ({ title: e.title, date: e.date, startTime: e.startTime })), null, 2)}
+
+DIRECTIVAS Y FUNCTION CALLING:
+1. Si el usuario menciona tareas por hacer, invoca create_project_task.
+2. Si menciona reuniones/citas con fecha/hora, invoca create_calendar_event.
+3. Si define decisiones o próximos pasos, invoca record_decision o set_next_step.
+4. Responde de forma clara y directa en español.`;
+    } else {
+      // Level 3: Deep Portfolio Analysis / Multi-project comparisons (~6s latency)
       systemInstruction = `Eres el Director de Estrategia e Inteligencia de "Project OS", un sistema personal y autónomo de alta fidelidad donde el usuario gestiona sus proyectos, tareas y calendario.
 
-CONTEXTO TEMPORAL DEL USUARIO (DISPOSITIVO):
+CONTEXTO TEMPORAL DEL USUARIO:
 - Fecha actual: ${timeContext.formattedDate} (${timeContext.currentDate})
-- Hora actual: ${timeContext.currentTime} (Zona horaria: ${timeContext.timezone})
-- Día de la semana: ${timeContext.weekday}
-- Mañana será: ${timeContext.tomorrowDate}
-- Ayer fue: ${timeContext.yesterdayDate}
+- Hora actual: ${timeContext.currentTime}
 
-EVENTOS ACTUALMENTE AGENDADOS EN EL CALENDARIO:
-${JSON.stringify(
-  liveEvents.map((e: any) => ({
-    id: e.id,
-    title: e.title,
-    date: e.date,
-    startTime: e.startTime,
-    endTime: e.endTime,
-    location: e.location,
-    status: e.status,
-    project: e.projectName,
-  })),
-  null,
-  2
-)}
+EVENTOS AGENDADOS:
+${JSON.stringify(liveEvents.map((e: any) => ({ title: e.title, date: e.date, startTime: e.startTime, project: e.projectName })), null, 2)}
 
 PORTFOLIO DE PROYECTOS DEL USUARIO:
 ${JSON.stringify(
@@ -2126,7 +2186,7 @@ ${JSON.stringify(
     mainGoal: p.mainGoal,
     nextStep: p.nextStep,
     pendingTasksCount: p.tasks?.filter((t: any) => t.status === 'pendiente').length || 0,
-    tasks: p.tasks?.map((t: any) => ({ id: t.id, title: t.title, status: t.status, dueDate: t.dueDate, priority: t.priority })),
+    tasks: p.tasks?.map((t: any) => ({ id: t.id, title: t.title, status: t.status, dueDate: t.dueDate })),
     decisionsCount: p.decisions?.length || 0,
     ideasCount: p.ideas?.length || 0,
   })),
@@ -2134,126 +2194,113 @@ ${JSON.stringify(
   2
 )}
 
-CAPACIDAD MULTITAREA Y LENGUAJE NATURAL FLUIDO:
-1. El usuario puede hablarte corrido, mezclar varias cosas en una sola frase o párrafo (por ejemplo: una reunión para mañana, dos tareas que tiene que hacer y una idea nueva).
-2. TIENES LA INTELIGENCIA para captar cada intención en lenguaje natural sin requerir comandos rígidos ni palabras clave exactas.
-3. SI DETECTAS MÚLTIPLES ACCIONES en un solo mensaje, DEBES LLAMAR A LAS HERRAMIENTAS CORRESPONDIENTES TANTAS VECES COMO SEA NECESARIO en la misma respuesta (ej. 2 llamadas a create_project_task y 1 llamada a create_calendar_event).
-
-ASIGNACIÓN INTELIGENTE DE PROYECTO (CRUCIAL):
-- Cuando el usuario mencione una tarea, analiza a cuál de sus proyectos pertenece por temática, palabras clave o contexto.
-- Si la tarea claramente pertenece a un proyecto existente (ej. "diseñar el logo" ➔ "Negocio de Reseñas" o el proyecto correspondiente), indica el nombre del proyecto en projectId.
-- Si la tarea es personal, cotidiana o no tiene relación con ningún proyecto existente (ej. "comprar repuestos para el auto", "comprar leche", "renovar el pasaporte"), NO la asignes a un proyecto de negocios o tecnología no relacionado. Deja projectId vacío o como "Personal & General" para que se guarde en la bandeja adecuada.
-
-REGLA DE ORO DE ACCIONES (SIN ALUCINACIONES):
-- Si el usuario menciona una reunión, llamada o cita con fecha/hora (ej. "mañana a las 4", "reunión el viernes", "llamada a las 15:00"): DEBES INVOCAR create_calendar_event. NUNCA respondas en texto que agendaste la reunión si no llamaste a la herramienta.
-- Si el usuario menciona tareas o pendientes por hacer: DEBES INVOCAR create_project_task. NUNCA respondas en texto que creaste la tarea si no llamaste a la herramienta.
-- Si el usuario solo comparte una charla casual o personal (anécdotas, comida, películas, saludo): responde cálidamente con empatía en 1 o 2 párrafos sin forzar herramientas.
-
 DIRECTIVAS Y FUNCTION CALLING:
-1. Tienes herramientas para gestionar eventos del calendario: create_calendar_event, update_calendar_event, delete_calendar_event, check_calendar_availability.
-2. Tienes herramientas para gestionar proyectos y tareas: create_project, delete_project, create_project_task, complete_project_task, update_project_task, delete_project_task, set_next_step, record_decision, record_idea, record_blocker.
-3. Si el usuario pide crear un proyecto o convertir una idea en proyecto explícitamente, SIEMPRE llama inmediatamente a create_project.
-4. Responde con un resumen claro, conciso y natural de lo realizado en español.
-`;
-    } else {
-      const activeProj = liveProjects.find((p) => p.id === activeProjectId) || liveProjects[0];
-      systemInstruction = `Eres el Agente Especializado y Copiloto del proyecto "${activeProj?.name || 'Proyecto'}" en "Project OS".
-
-CONTEXTO TEMPORAL DEL USUARIO (DISPOSITIVO):
-- Fecha actual: ${timeContext.formattedDate} (${timeContext.currentDate})
-- Hora actual: ${timeContext.currentTime} (Zona horaria: ${timeContext.timezone})
-- Día de la semana: ${timeContext.weekday}
-- Mañana será: ${timeContext.tomorrowDate}
-- Ayer fue: ${timeContext.yesterdayDate}
-
-EVENTOS AGENDADOS EN EL CALENDARIO:
-${JSON.stringify(
-  liveEvents.map((e: any) => ({
-    id: e.id,
-    title: e.title,
-    date: e.date,
-    startTime: e.startTime,
-    endTime: e.endTime,
-    location: e.location,
-    project: e.projectName,
-  })),
-  null,
-  2
-)}
-
-CONTEXTO DEL PROYECTO ACTUAL ("${activeProj?.name}"):
-- ID: ${activeProj?.id}
-- Nombre: ${activeProj?.name}
-- Categoría: ${activeProj?.category}
-- Estado: ${activeProj?.status}
-- Objetivo Principal: ${activeProj?.mainGoal}
-- Próximo Paso Actual: ${activeProj?.nextStep}
-- Tareas Existentes:
-${JSON.stringify(
-  activeProj?.tasks?.map((t: any) => ({
-    id: t.id,
-    title: t.title,
-    status: t.status,
-    dueDate: t.dueDate,
-    dueTime: t.dueTime,
-    priority: t.priority,
-  })) || [],
-  null,
-  2
-)}
-- Decisiones Previas: ${JSON.stringify(activeProj?.decisions?.map((d: any) => ({ title: d.title, date: d.date })) || [])}
-- Ideas: ${JSON.stringify(activeProj?.ideas?.map((i: any) => i.title) || [])}
-- Hitos: ${JSON.stringify(activeProj?.milestones?.map((m: any) => ({ title: m.title, completed: m.completed })) || [])}
-
-CAPACIDAD MULTITAREA Y LENGUAJE NATURAL FLUIDO:
-1. El usuario puede hablarte corrido y expresar múltiples cosas en una sola intervención.
-2. Si detectas tareas para este proyecto ("tengo que...", "hay que..."), LLAMA A create_project_task asociadas a este proyecto.
-3. Si detectas una reunión o llamada con fecha/hora, LLAMA A create_calendar_event.
-4. Si el usuario te habla de forma relajada o casual, responde de forma empática y reflexiva.
-5. REGLA DE ORO: NUNCA afirmes haber agendado o creado una tarea o evento si no has ejecutado la herramienta correspondiente.
-`;
+1. Tienes herramientas para gestionar eventos, proyectos y tareas.
+2. Si el usuario pide analizar, comparar o priorizar el portfolio completo, realiza un análisis estratégico claro.
+3. Responde en español de forma estructurada.`;
     }
 
+    const isStreamRequested = Boolean(req.body.stream || req.headers.accept?.includes('text/event-stream'));
+
     if (ai) {
-      const geminiResult = await runGeminiConversationWithTools(
-        ai,
-        messages,
-        systemInstruction,
-        liveProjects,
-        liveEvents,
-        activeProjectId,
-        timeContext,
-        accumulatedActions,
-        true // Always enable tools so Gemini can call actions organically from natural language
-      );
+      if (isStreamRequested) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders?.();
 
-      if (geminiResult) {
-        const updatedProject = liveProjects.find((p) => p.id === activeProjectId);
+        const geminiResult = await runGeminiConversationWithTools(
+          ai,
+          messages,
+          systemInstruction,
+          liveProjects,
+          liveEvents,
+          activeProjectId,
+          timeContext,
+          accumulatedActions,
+          enableTools,
+          (chunkText) => {
+            res.write(`data: ${JSON.stringify({ chunk: chunkText })}\n\n`);
+          }
+        );
 
-        return res.json({
-          reply: geminiResult.reply,
-          actionsExecuted: accumulatedActions,
-          memoryUpdates: accumulatedActions.map((act) => ({
-            id: `mem-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
-            type: act.type.includes('decision')
-              ? 'decision'
-              : act.type.includes('next_step')
-              ? 'next_step'
-              : act.type.includes('idea')
-              ? 'idea'
-              : act.type.includes('blocker')
-              ? 'problem'
-              : 'task',
-            title: act.details,
-            description: act.label,
-            applied: true,
-          })),
-          updatedProjects: liveProjects,
-          updatedProject: updatedProject || undefined,
-          updatedEvents: liveEvents,
-          provider: 'gemini',
-          model: geminiResult.modelUsed,
-        });
+        if (geminiResult) {
+          const updatedProject = liveProjects.find((p) => p.id === activeProjectId);
+          const finalPayload = {
+            reply: geminiResult.reply,
+            actionsExecuted: accumulatedActions,
+            memoryUpdates: accumulatedActions.map((act) => ({
+              id: `mem-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+              type: act.type.includes('decision')
+                ? 'decision'
+                : act.type.includes('next_step')
+                ? 'next_step'
+                : act.type.includes('idea')
+                ? 'idea'
+                : act.type.includes('blocker')
+                ? 'problem'
+                : 'task',
+              title: act.details,
+              description: act.label,
+              applied: true,
+            })),
+            updatedProjects: liveProjects,
+            updatedProject: updatedProject || undefined,
+            updatedEvents: liveEvents,
+            provider: 'gemini',
+            model: geminiResult.modelUsed,
+          };
+
+          // If stream fast-tracked directly from single-turn function execution
+          if (accumulatedActions.length > 0) {
+            res.write(`data: ${JSON.stringify({ chunk: geminiResult.reply })}\n\n`);
+          }
+
+          res.write(`data: ${JSON.stringify({ done: true, finalPayload })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          return res.end();
+        }
+      } else {
+        const geminiResult = await runGeminiConversationWithTools(
+          ai,
+          messages,
+          systemInstruction,
+          liveProjects,
+          liveEvents,
+          activeProjectId,
+          timeContext,
+          accumulatedActions,
+          enableTools
+        );
+
+        if (geminiResult) {
+          const updatedProject = liveProjects.find((p) => p.id === activeProjectId);
+
+          return res.json({
+            reply: geminiResult.reply,
+            actionsExecuted: accumulatedActions,
+            memoryUpdates: accumulatedActions.map((act) => ({
+              id: `mem-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+              type: act.type.includes('decision')
+                ? 'decision'
+                : act.type.includes('next_step')
+                ? 'next_step'
+                : act.type.includes('idea')
+                ? 'idea'
+                : act.type.includes('blocker')
+                ? 'problem'
+                : 'task',
+              title: act.details,
+              description: act.label,
+              applied: true,
+            })),
+            updatedProjects: liveProjects,
+            updatedProject: updatedProject || undefined,
+            updatedEvents: liveEvents,
+            provider: 'gemini',
+            model: geminiResult.modelUsed,
+          });
+        }
       }
 
       console.warn('[Gemini Provider] External models temporarily unavailable, serving with local intelligence engine fallback.');
@@ -2264,7 +2311,6 @@ CAPACIDAD MULTITAREA Y LENGUAJE NATURAL FLUIDO:
       ? 'GEMINI_API_KEY no está configurada o es vacía en el servidor. Se está utilizando el motor local de contingencia.'
       : 'Todos los candidatos del modelo Gemini fallaron o la API key no es válida. Se está utilizando el motor local de contingencia.';
 
-    const projectNames = liveProjects.map((p) => p.name).filter(Boolean);
     const isProjectRelated = isProjectOSIntent(userText, projectNames);
 
     const localResult = executeLocalIntelligentEngine(

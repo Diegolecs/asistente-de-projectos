@@ -3,6 +3,7 @@
  * Handles voice recording with MediaRecorder, transcription via Gemini,
  * and text-to-speech playback with msedge-tts backend.
  */
+import { getApiBaseUrl } from '../utils/config';
 
 // Supported MIME types for MediaRecorder across Chrome, Safari, Firefox, Edge
 function getSupportedMimeType(): string {
@@ -97,13 +98,19 @@ class AudioService {
       this.audioChunks = [];
       // Configure audio capture for high sensitivity: avoid aggressive noise cancellation
       // that suppresses soft whispers, and enable autoGainControl to boost quiet voices
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: false, // Prevents whispers from being swallowed as noise
-          autoGainControl: true,   // Dynamically boosts soft whispers and murmurs
-        },
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: false,
+            autoGainControl: true,
+          },
+        });
+      } catch {
+        // Fallback for hardware HALs (e.g. OPPO/ColorOS) that reject strict constraints
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
 
       this.mediaStream = stream;
 
@@ -344,9 +351,9 @@ class AudioService {
     // Fast-path: Check if local SpeechRecognition captured a complete, usable phrase (>= 3 words)
     const isUsableClientHint = Boolean(localHint && localHint.split(/\s+/).length >= 3);
 
-    // Single primary server endpoint (/api/transcribe-audio or VITE_API_BASE_URL)
-    const baseUrl = (import.meta.env?.VITE_API_BASE_URL as string) || '';
-    const endpoint = baseUrl ? `${baseUrl.replace(/\/$/, '')}/api/transcribe-audio` : '/api/transcribe-audio';
+    // Single primary server endpoint (using getApiBaseUrl for automatic Capacitor Android fallback)
+    const baseUrl = getApiBaseUrl();
+    const endpoint = baseUrl ? `${baseUrl}/api/transcribe-audio` : '/api/transcribe-audio';
 
     const tNetworkStart = performance.now();
     try {
@@ -378,15 +385,31 @@ class AudioService {
         if (!text && localHint) {
           text = localHint;
         }
-        if (data.isSilence || (!text && data.message)) {
-          return { text: '', isSilence: true, error: data.message || 'No se detectó voz clara en el audio.' };
+        if (data.isSilence || (!text && (data.message || data.success === false))) {
+          return {
+            text: '',
+            isSilence: true,
+            error: data.message || 'No se detectó voz clara en el audio grabado. Por favor, habla de nuevo.',
+          };
         }
         return { text };
       } else {
         console.warn(`[AudioService] Server transcribe error status: ${response.status} (${networkMs}ms)`);
+        if (!isUsableClientHint && !localHint) {
+          return {
+            text: '',
+            error: `Inconveniente temporal en el servidor de transcripción (código ${response.status}). Por favor reintenta.`,
+          };
+        }
       }
     } catch (fetchErr) {
       console.warn('[AudioService] Server transcribe endpoint unreachable or network error:', fetchErr);
+      if (!isUsableClientHint && !localHint) {
+        return {
+          text: '',
+          error: 'No fue posible conectar con el servidor. Comprueba tu conexión a internet e inténtalo de nuevo.',
+        };
+      }
     }
 
     // Controlled Recovery Flow: Use local SpeechRecognition if server was unreachable or failed
@@ -400,20 +423,20 @@ class AudioService {
       if (this.recognitionError === 'not-allowed' || this.recognitionError === 'service-not-allowed') {
         return {
           text: '',
-          error: 'Servicio de voz no disponible en este navegador. Configura VITE_API_BASE_URL o habilita los permisos de micrófono.'
+          error: 'Permiso de micrófono no disponible. Habilita los permisos de micrófono en los ajustes de tu dispositivo.'
         };
       }
       if (this.recognitionError === 'network') {
         return {
           text: '',
-          error: 'Error de red al procesar el reconocimiento de voz. Comprueba tu conexión a internet.'
+          error: 'No fue posible conectar con el servidor. Comprueba tu conexión a internet e inténtalo de nuevo.'
         };
       }
       if (this.recognitionError === 'no-speech') {
         return {
           text: '',
           isSilence: true,
-          error: 'No se detectó habla en el audio grabado. Por favor, habla de nuevo.'
+          error: 'No se detectó voz clara en el audio grabado. Por favor, habla de nuevo.'
         };
       }
     }
@@ -422,14 +445,14 @@ class AudioService {
     if (isNative) {
       return {
         text: '',
-        error: 'No se pudo conectar al servidor de transcripción en Android. Configura VITE_API_BASE_URL en la aplicación.'
+        error: 'No fue posible conectar con el servidor. Comprueba tu conexión a internet e inténtalo de nuevo.'
       };
     }
 
     return {
       text: '',
       isSilence: true,
-      error: 'No se reconoció voz clara en el audio grabado.'
+      error: 'No se detectó voz clara en el audio grabado. Por favor, habla de nuevo.'
     };
   }
 
@@ -485,7 +508,7 @@ class AudioService {
 
     try {
       // 1. Attempt server msedge-tts endpoint
-      const baseUrl = (import.meta.env?.VITE_API_BASE_URL as string || '').replace(/\/$/, '');
+      const baseUrl = getApiBaseUrl();
       const ttsUrl = baseUrl ? `${baseUrl}/api/tts` : '/api/tts';
 
       const response = await fetch(ttsUrl, {

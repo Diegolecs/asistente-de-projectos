@@ -135,9 +135,9 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children, onOpenCreateModa
                 Project OS
               </h1>
               <div className="flex items-center gap-1.5 mt-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                <span className={`w-1.5 h-1.5 rounded-full ${aiStatus.activeProvider === 'gemini' && aiStatus.hasGeminiKey ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
                 <span className="text-[11px] text-zinc-500 font-medium">
-                  {aiStatus.hasGeminiKey ? 'Gemini 3.8 Flash' : 'Motor IA Activo'}
+                  {aiStatus.activeProvider === 'gemini' && aiStatus.hasGeminiKey ? 'Gemini 3.8 Flash' : 'Motor Local (Offline)'}
                 </span>
               </div>
             </div>

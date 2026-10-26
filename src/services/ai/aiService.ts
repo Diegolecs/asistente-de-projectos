@@ -2,6 +2,7 @@ import { ChatMessage } from '../../types';
 import { AIChatOptions, AIChatResponse, AIProvider, AIProviderStatus } from './types';
 import { GeminiProvider } from './geminiProvider';
 import { MockAIProvider } from './mockProvider';
+import { getApiBaseUrl } from '../../utils/config';
 
 class AIService {
   private activeProvider: AIProvider;
@@ -21,7 +22,7 @@ class AIService {
     if (this.isCheckingHealth) return this.status;
     this.isCheckingHealth = true;
     try {
-      const baseUrl = (import.meta.env?.VITE_API_BASE_URL as string || '').replace(/\/$/, '');
+      const baseUrl = getApiBaseUrl();
       const healthUrl = baseUrl ? `${baseUrl}/api/health` : '/api/health';
       const res = await fetch(healthUrl);
       if (res.ok) {
@@ -29,26 +30,26 @@ class AIService {
         const hasKey = Boolean(data.hasGeminiKey);
         this.status = {
           hasGeminiKey: hasKey,
-          activeProvider: hasKey ? 'gemini' : 'local',
+          activeProvider: 'gemini',
           model: data.model || 'gemini-3.8-flash',
         };
-        this.setProvider(hasKey ? 'gemini' : 'local');
+        this.setProvider('gemini');
       } else {
         this.status = {
           hasGeminiKey: false,
-          activeProvider: 'local',
-          model: 'local-intelligence',
+          activeProvider: 'gemini',
+          model: 'gemini-3.8-flash',
         };
-        this.setProvider('local');
+        this.setProvider('gemini');
       }
     } catch {
-      // In standalone client or offline mode
+      // In mobile app or network startup, keep Gemini as primary active provider
       this.status = {
-        hasGeminiKey: false,
-        activeProvider: 'local',
-        model: 'local-intelligence',
+        hasGeminiKey: true,
+        activeProvider: 'gemini',
+        model: 'gemini-3.8-flash',
       };
-      this.setProvider('local');
+      this.setProvider('gemini');
     } finally {
       this.isCheckingHealth = false;
     }

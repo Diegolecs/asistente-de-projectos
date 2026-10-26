@@ -186,3 +186,45 @@ export function isProjectOSIntent(text: string, projectNames: string[] = []): bo
 
   return false;
 }
+
+export type ContextLevel = 'general' | 'project' | 'portfolio';
+
+/**
+ * Mapeo inteligente de arquitectura en 3 niveles de contexto para el agente:
+ * - 'general': Charlas casuales, saludos, preguntas genéricas, ayuda puntual (Nivel 1 - Rápido, ~1.5s).
+ * - 'project': Consultas sobre un proyecto específico, tareas, calendario, decisiones (Nivel 2 - Dirigido, ~3s).
+ * - 'portfolio': Análisis profundo del portfolio completo, estado global y priorización (Nivel 3 - Amplio, ~6s).
+ */
+export function detectContextLevel(text: string, projectNames: string[] = []): ContextLevel {
+  if (!text || typeof text !== 'string') return 'general';
+  const lower = text.toLowerCase().trim();
+
+  // Nivel 3: Portfolio Completo (Análisis amplio y comparativo)
+  const portfolioKeywords = [
+    'portfolio',
+    'todos los proyectos',
+    'todos mis proyectos',
+    'mis proyectos',
+    'resumen general',
+    'estado de mis proyectos',
+    'priorizar portfolio',
+    'prioridades generales',
+    'cuáles están activos',
+    'cuales estan activos',
+    'qué proyectos tengo',
+    'que proyectos tengo',
+    'repasar portfolio',
+    'comparar proyectos',
+  ];
+  if (portfolioKeywords.some((kw) => lower.includes(kw))) {
+    return 'portfolio';
+  }
+
+  // Nivel 2: Proyecto o Acción concreta (Tareas, calendario, decisiones, proyecto específico)
+  if (isProjectOSIntent(text, projectNames)) {
+    return 'project';
+  }
+
+  // Nivel 1: Conversación General o pregunta genérica sin acción sobre proyectos
+  return 'general';
+}

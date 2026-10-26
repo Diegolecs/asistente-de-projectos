@@ -821,9 +821,18 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
       const updatedHistory = [...(targetProject.messages || []), userMsg];
 
-      // Optimistically append user message to UI
+      const assistantMsgId = `msg-${Date.now()}-ai`;
+      const placeholderAssistantMsg: ChatMessage = {
+        id: assistantMsgId,
+        projectId,
+        role: 'assistant',
+        content: '',
+        timestamp: new Date().toISOString(),
+      };
+
+      // Optimistically append user message and placeholder assistant message for streaming
       setProjects((prev) =>
-        prev.map((p) => (p.id === projectId ? { ...p, messages: updatedHistory } : p))
+        prev.map((p) => (p.id === projectId ? { ...p, messages: [...updatedHistory, placeholderAssistantMsg] } : p))
       );
 
       setIsAiThinking(true);
@@ -834,10 +843,23 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({ child
           projectContext: projects,
           eventsContext: events,
           isGeneral: false,
+          stream: true,
+          onChunk: (_chunk, accumulated) => {
+            setIsAiThinking(false);
+            setProjects((prev) =>
+              prev.map((p) => {
+                if (p.id !== projectId) return p;
+                const msgs = (p.messages || []).map((m) =>
+                  m.id === assistantMsgId ? { ...m, content: accumulated } : m
+                );
+                return { ...p, messages: msgs };
+              })
+            );
+          },
         });
 
         const assistantMsg: ChatMessage = {
-          id: `msg-${Date.now()}-ai`,
+          id: assistantMsgId,
           projectId,
           role: 'assistant',
           content: response.reply,
@@ -957,20 +979,36 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({ child
         timestamp: new Date().toISOString(),
       };
 
-      const newHistory = [...generalMessages, userMsg];
+      const assistantMsgId = `gen-msg-${Date.now()}-ai`;
+      const placeholderAssistantMsg: ChatMessage = {
+        id: assistantMsgId,
+        projectId: 'general',
+        role: 'assistant',
+        content: '',
+        timestamp: new Date().toISOString(),
+      };
+
+      const newHistory = [...generalMessages, userMsg, placeholderAssistantMsg];
       setGeneralMessages(newHistory);
       setIsAiThinking(true);
 
       try {
-        const response = await aiService.sendMessage(newHistory, {
+        const response = await aiService.sendMessage(newHistory.slice(0, -1), {
           projectId: 'general',
           projectContext: projects,
           eventsContext: events,
           isGeneral: true,
+          stream: true,
+          onChunk: (_chunk, accumulated) => {
+            setIsAiThinking(false);
+            setGeneralMessages((prev) =>
+              prev.map((m) => (m.id === assistantMsgId ? { ...m, content: accumulated } : m))
+            );
+          },
         });
 
         const assistantMsg: ChatMessage = {
-          id: `gen-msg-${Date.now()}-ai`,
+          id: assistantMsgId,
           projectId: 'general',
           role: 'assistant',
           content: response.reply,
@@ -991,17 +1029,21 @@ export const ProjectProvider: React.FC<{ children: React.ReactNode }> = ({ child
           }
         }
 
-        setGeneralMessages((prev) => [...prev, assistantMsg]);
+        setGeneralMessages((prev) =>
+          prev.map((m) => (m.id === assistantMsgId ? assistantMsg : m))
+        );
       } catch (err) {
         console.warn('Temporary issue getting general AI response, falling back safely:', err);
         const errorMsg: ChatMessage = {
-          id: `gen-msg-${Date.now()}-err`,
+          id: assistantMsgId,
           projectId: 'general',
           role: 'assistant',
           content: 'No fue posible procesar la consulta en este momento. Por favor reintenta.',
           timestamp: new Date().toISOString(),
         };
-        setGeneralMessages((prev) => [...prev, errorMsg]);
+        setGeneralMessages((prev) =>
+          prev.map((m) => (m.id === assistantMsgId ? errorMsg : m))
+        );
       } finally {
         setIsAiThinking(false);
       }

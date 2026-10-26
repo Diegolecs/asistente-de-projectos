@@ -13,6 +13,8 @@ export interface AIChatOptions {
   projectContext?: Project | Project[];
   eventsContext?: CalendarEvent[];
   timeContext?: DeviceTimeContext;
+  stream?: boolean;
+  onChunk?: (chunkText: string, fullText: string) => void;
 }
 
 export interface AIChatResponse {
